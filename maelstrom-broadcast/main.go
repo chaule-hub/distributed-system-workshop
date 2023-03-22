@@ -15,6 +15,11 @@ type BroadcastBody struct {
 	Message int    `json:"message"`
 }
 
+type BatchBroadcastBody struct {
+	Type     string `json:"type"`
+	Messages []int  `json:"messages"`
+}
+
 type TopologyBody struct {
 	Type     string              `json:"type"`
 	Topology map[string][]string `json:"topology"`
@@ -33,6 +38,9 @@ type NodeServer struct {
 
 	Topology   []string
 	TopologyMu sync.RWMutex
+
+	UnbroadcastedMessages   []int
+	UnbroadcastedMessagesMu sync.RWMutex
 }
 
 func (s *NodeServer) handleBroadcast(msg maelstrom.Message) error {
@@ -45,11 +53,40 @@ func (s *NodeServer) handleBroadcast(msg maelstrom.Message) error {
 		Type: "broadcast_ok",
 	})
 
-	message, messageExists := s.extractMessage(body)
+	s.handleMessage(body.Message)
+
+	return nil
+}
+
+func (s *NodeServer) checkMessageExists(message int) bool {
+	s.MessagesMu.Lock()
+	defer s.MessagesMu.Unlock()
+
+	_, messageExists := s.Messages[message]
+	return messageExists
+}
+
+func (s *NodeServer) handleMessage(message int) {
+	messageExists := s.checkMessageExists(message)
 
 	if !(messageExists) {
 		s.saveMessage(message)
-		s.broadcast(body, msg.Src)
+	}
+}
+
+func (s *NodeServer) handleBatchBroadcast(msg maelstrom.Message) error {
+	var body BatchBroadcastBody
+	if err := json.Unmarshal(msg.Body, &body); err != nil {
+		return err
+	}
+
+	go s.Node.Reply(msg, maelstrom.MessageBody{
+		Type: "batch_broadcast_ok",
+	})
+
+	messages := body.Messages
+	for _, msg := range messages {
+		s.handleMessage(msg)
 	}
 
 	return nil
@@ -57,46 +94,66 @@ func (s *NodeServer) handleBroadcast(msg maelstrom.Message) error {
 
 func (s *NodeServer) saveMessage(message int) {
 	s.MessagesMu.Lock()
-	defer s.MessagesMu.Unlock()
-
 	s.Messages[message] = struct{}{}
+	s.MessagesMu.Unlock()
+
+	s.UnbroadcastedMessagesMu.Lock()
+	s.UnbroadcastedMessages = append(s.UnbroadcastedMessages, message)
+	s.UnbroadcastedMessagesMu.Unlock()
 }
 
-func (s *NodeServer) extractMessage(body BroadcastBody) (int, bool) {
-	s.MessagesMu.RLock()
-	defer s.MessagesMu.RUnlock()
+func (s *NodeServer) broadcastInBatch() {
+	topology := s.getTopology()
+	messages := s.getUnbroadcastMessages()
 
-	message := body.Message
-	_, messageExists := s.Messages[message]
+	for _, node := range topology {
+		go s.sendWithRetries(node, BatchBroadcastBody{
+			Type:     "batch_broadcast",
+			Messages: messages,
+		})
+	}
 
-	return message, messageExists
+	s.resetUnbroadcastMessages()
 }
 
-func (s *NodeServer) broadcast(body BroadcastBody, src string) {
+func (s *NodeServer) getUnbroadcastMessages() []int {
+	s.UnbroadcastedMessagesMu.RLock()
+	defer s.UnbroadcastedMessagesMu.RUnlock()
+
+	messages := make([]int, len(s.UnbroadcastedMessages))
+	copy(messages, s.UnbroadcastedMessages)
+	return messages
+}
+
+func (s *NodeServer) getTopology() []string {
 	s.TopologyMu.RLock()
 	defer s.TopologyMu.RUnlock()
 
 	topology := make([]string, len(s.Topology))
 	copy(topology, s.Topology)
-
-	for _, node := range topology {
-		if node != src {
-			go s.sendWithRetries(node, body)
-		}
-	}
+	return topology
 }
 
-func (s *NodeServer) sendWithRetries(dest string, body BroadcastBody) {
-	maxRetries := 10
+func (s *NodeServer) resetUnbroadcastMessages() {
+	s.UnbroadcastedMessagesMu.Lock()
+	defer s.UnbroadcastedMessagesMu.Unlock()
+
+	s.UnbroadcastedMessages = make([]int, 0)
+}
+
+func (s *NodeServer) sendWithRetries(dest string, body any) bool {
+	maxRetries := 100
 	for i := 0; i < maxRetries; i++ {
 		context, cancel := context.WithTimeout(context.Background(), time.Duration(2*(i+1))*time.Second)
 		defer cancel()
 
 		_, err := s.Node.SyncRPC(context, dest, body)
 		if err == nil {
-			return
+			return true
 		}
 	}
+
+	return false
 }
 
 func (s *NodeServer) handleRead(msg maelstrom.Message) error {
@@ -121,7 +178,12 @@ func (s *NodeServer) handleTopology(msg maelstrom.Message) error {
 	}
 
 	s.TopologyMu.Lock()
-	s.Topology = body.Topology[s.Node.ID()]
+	if s.Node.ID() == s.Node.NodeIDs()[0] {
+		s.Topology = s.Node.NodeIDs()[1:]
+	} else {
+		s.Topology = []string{s.Node.NodeIDs()[0]}
+	}
+	// s.Topology = body.Topology[s.Node.ID()]
 	s.TopologyMu.Unlock()
 
 	return s.Node.Reply(msg, maelstrom.MessageBody{
@@ -140,6 +202,14 @@ func main() {
 	n.Handle("broadcast", server.handleBroadcast)
 	n.Handle("read", server.handleRead)
 	n.Handle("topology", server.handleTopology)
+	n.Handle("batch_broadcast", server.handleBatchBroadcast)
+
+	go func() {
+		for {
+			server.broadcastInBatch()
+			time.Sleep(700 * time.Millisecond)
+		}
+	}()
 
 	if err := n.Run(); err != nil {
 		log.Fatal(err)
